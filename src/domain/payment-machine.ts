@@ -353,6 +353,12 @@ export function plan(p: PaymentState, trigger: Trigger, deps: MachineDeps): Plan
        * Baixa manual: o Asaas NÃO credita saldo nem gera movimentação
        * financeira — o dinheiro foi para o bolso do lojista, fora da plataforma.
        * Por isso não há efeito de LEDGER aqui. É fácil errar isso.
+       *
+       * O webhook, esse sim, sai: a doc lista o fluxo "Cash payment confirmed:
+       * PAYMENT_CREATED → PAYMENT_RECEIVED (billingType will be RECEIVED_IN_CASH)".
+       * O evento é PAYMENT_RECEIVED mesmo com status RECEIVED_IN_CASH — quem
+       * quiser distinguir baixa manual olha o billingType, não o evento.
+       * docs.asaas.com → "Events for Payments".
        */
       return {
         to: 'RECEIVED_IN_CASH',
@@ -361,7 +367,10 @@ export function plan(p: PaymentState, trigger: Trigger, deps: MachineDeps): Plan
           paymentDate: trigger.on,
           clientPaymentDate: trigger.on,
         },
-        effects: [{ t: 'SPLIT', to: 'CANCELLED', reason: 'PAYMENT_RECEIVED_IN_CASH' }],
+        effects: [
+          { t: 'WEBHOOK', event: 'PAYMENT_RECEIVED' },
+          { t: 'SPLIT', to: 'CANCELLED', reason: 'PAYMENT_RECEIVED_IN_CASH' },
+        ],
       }
     }
 

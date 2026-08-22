@@ -241,6 +241,47 @@ describe('Recebimento em dinheiro — NÃO gera saldo', () => {
 
     await h.assertLedgerBalances()
   })
+
+  /**
+   * O webhook, porém, SAI na baixa manual: a doc lista o fluxo "Cash payment
+   * confirmed: PAYMENT_CREATED → PAYMENT_RECEIVED (billingType will be
+   * RECEIVED_IN_CASH)". O evento é PAYMENT_RECEIVED mesmo com o status em
+   * RECEIVED_IN_CASH — quem precisa distinguir baixa manual olha o billingType,
+   * não o nome do evento. Antes deste teste o simulador não emitia NADA aqui, e
+   * integrações sincronizadas por webhook nunca viam a cobrança pagar.
+   */
+  it('baixa em dinheiro emite PAYMENT_RECEIVED — e desfazer emite UNDONE', async () => {
+    await h.subscribeWebhook(['PAYMENT_RECEIVED', 'PAYMENT_RECEIVED_IN_CASH_UNDONE'])
+
+    const cus = await customer()
+    const created = await h.api.call('create-new-payment', {
+      body: { customer: cus, billingType: 'BOLETO', value: 100, dueDate: '2026-01-10' },
+    })
+
+    const res = await h.api.call('confirm-cash-receipt', {
+      params: { id: created.body.id },
+      body: { paymentDate: '2026-01-05', value: 100 },
+    })
+    expect(res.body.status).toBe('RECEIVED_IN_CASH')
+
+    await h.tick()
+
+    expect(h.sink.received).toHaveLength(1)
+    expect(h.sink.received[0]!.payload.event).toBe('PAYMENT_RECEIVED')
+    expect(h.sink.received[0]!.payload.payment.status).toBe('RECEIVED_IN_CASH')
+    expect(h.sink.received[0]!.payload.payment.billingType).toBe('BOLETO')
+
+    h.sink.received.length = 0
+    const undone = await h.api.call('undo-cash-receipt-confirmation', {
+      params: { id: created.body.id },
+    })
+    expect(undone.body.status).toBe('PENDING')
+
+    await h.tick()
+    expect(h.sink.received.map((r) => r.payload.event)).toEqual([
+      'PAYMENT_RECEIVED_IN_CASH_UNDONE',
+    ])
+  })
 })
 
 describe('Estorno', () => {

@@ -269,7 +269,7 @@ describe('queueHealth — por que a fila não anda', () => {
 // ────────────────────────────────────────────────────────── CRUD
 
 describe('webhooks — CRUD', () => {
-  it('cria, recupera, lista e remove — e nunca devolve o authToken', async () => {
+  it('cria, recupera, lista e remove — o VALOR do authToken só sai na criação', async () => {
     const created = await createWebhook({ name: 'Meu webhook' })
 
     expect(created.id).toBeString()
@@ -277,9 +277,10 @@ describe('webhooks — CRUD', () => {
     expect(created.enabled).toBe(true)
     expect(created.interrupted).toBe(false)
     expect(created.apiVersion).toBe(3)
-    // O token só sai daqui dentro do header de uma entrega.
+    // A criação devolve o token informado — é a promessa da doc ("The token
+    // value is returned only when the Webhook is created").
     expect(created.hasAuthToken).toBe(true)
-    expect(created).not.toHaveProperty('authToken')
+    expect(created.authToken).toBe('a'.repeat(32))
     expect(created.events).toEqual([
       'PAYMENT_CREATED',
       'PAYMENT_CONFIRMED',
@@ -290,11 +291,15 @@ describe('webhooks — CRUD', () => {
       params: { id: created.id },
     })
     expect(got.body.id).toBe(created.id)
+    // Depois de criado, só hasAuthToken — o valor nunca mais sai pela API.
+    expect(got.body).not.toHaveProperty('authToken')
+    expect(got.body.hasAuthToken).toBe(true)
 
     const list = await h.api.call('list-webhooks')
     expect(list.body.object).toBe('list')
     expect(list.body.totalCount).toBe(1)
     expect(list.body.data[0].id).toBe(created.id)
+    expect(list.body.data[0]).not.toHaveProperty('authToken')
 
     const del = await h.api.call('remove-webhook', { params: { id: created.id } })
     expect(del.body).toEqual({ deleted: true, id: created.id })
@@ -303,6 +308,47 @@ describe('webhooks — CRUD', () => {
       params: { id: created.id },
     })
     expect(gone.status).toBe(404)
+  })
+
+  /**
+   * "If the field is not provided, Asaas will automatically generate a secure
+   * value." (docs.asaas.com → Create a new Webhook through the API). O valor
+   * gerado volta NESTA resposta — depois, só no header das entregas.
+   */
+  it('POST sem authToken gera um token seguro — e devolve o valor só na criação', async () => {
+    const created = await createWebhook({ authToken: undefined })
+
+    expect(typeof created.authToken).toBe('string')
+    expect((created.authToken as string).length).toBeGreaterThanOrEqual(32)
+    expect((created.authToken as string).length).toBeLessThanOrEqual(255)
+    expect(created.authToken).not.toMatch(/\s/)
+    expect(created.hasAuthToken).toBe(true)
+
+    const got = await h.api.call('retrieve-a-single-webhook', {
+      params: { id: created.id },
+    })
+    expect(got.body).not.toHaveProperty('authToken')
+
+    // E é este token gerado que sai no header de cada entrega.
+    await emit('PAYMENT_RECEIVED', { id: 'pay_000000000001' })
+    await h.tick()
+    expect(h.sink.received[0]!.headers['asaas-access-token']).toBe(created.authToken)
+  })
+
+  it('recusa authToken com espaço em branco', async () => {
+    const res = await h.api.call('create-new-webhook', {
+      body: {
+        name: 'token com espaço',
+        url: h.sink.url,
+        email: 'dev@localhost',
+        sendType: 'NON_SEQUENTIALLY',
+        authToken: `${'a'.repeat(31)} b`,
+        events: ['PAYMENT_RECEIVED'],
+      },
+    })
+    expect(res.status).toBe(400)
+    expect(res.body.errors[0].code).toBe('invalid_authToken')
+    expect(res.body.errors[0].description).toContain('espaços em branco')
   })
 
   it('recusa o 11º webhook da conta', async () => {
@@ -374,7 +420,14 @@ describe('webhooks — entrega', () => {
   })
 
   it('não manda o header quando o webhook não tem authToken', async () => {
-    await createWebhook({ authToken: undefined })
+    // Sem informar token o POST hoje GERA um (doc) — para ficar sem, é o PUT
+    // que limpa.
+    const wh = await createWebhook()
+    await h.api.call('update-existing-webhook', {
+      params: { id: wh.id },
+      body: { authToken: null },
+    })
+
     await emit('PAYMENT_RECEIVED', { id: 'pay_000000000001' })
     await h.tick()
 

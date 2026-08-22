@@ -11,9 +11,11 @@
  *     zera o contador de tentativas, reagenda tudo para agora e solta a fila.
  *     É o botão que o dev aperta depois de consertar o endpoint dele.
  *
- * A resposta NÃO devolve o `authToken` — só `hasAuthToken`. É o que a spec diz e
- * é o que o Asaas faz: o token só sai daqui dentro do header `asaas-access-token`
- * de uma entrega.
+ * O `authToken` segue a doc (docs.asaas.com → "Create a new Webhook through the
+ * API"): se não informado no POST, o Asaas gera um valor seguro sozinho; e o
+ * VALOR só é devolvido na resposta de CRIAÇÃO — GET, PUT e listagem expõem
+ * apenas `hasAuthToken`. Depois de criado, o token só volta a sair daqui dentro
+ * do header `asaas-access-token` de uma entrega.
  */
 import { and, asc, count, eq, inArray } from 'drizzle-orm'
 import type { AppContext } from '../../core/context.ts'
@@ -30,7 +32,12 @@ type SendType = WebhookRow['sendType']
 const AUTH_TOKEN_MIN = 32
 const AUTH_TOKEN_MAX = 255
 
-function serialize(row: WebhookRow) {
+/**
+ * O valor do token SÓ aparece na resposta de criação (`withAuthToken: true`) —
+ * é a promessa da doc: "The token value is returned only when the Webhook is
+ * created". Em todo o resto, só `hasAuthToken`.
+ */
+function serialize(row: WebhookRow, withAuthToken = false) {
   return {
     id: row.id,
     name: row.name,
@@ -39,6 +46,9 @@ function serialize(row: WebhookRow) {
     enabled: row.enabled,
     interrupted: row.interrupted,
     apiVersion: row.apiVersion,
+    ...(withAuthToken && row.authToken !== null && row.authToken !== ''
+      ? { authToken: row.authToken }
+      : {}),
     hasAuthToken: row.authToken !== null && row.authToken !== '',
     sendType: row.sendType,
     /**
@@ -53,6 +63,14 @@ function serialize(row: WebhookRow) {
   }
 }
 
+/**
+ * Valida um `authToken` informado. A doc exige 32–255 caracteres e proíbe
+ * espaços em branco ("not contain blank spaces"); as outras regras da doc
+ * ("not use simple sequences", "not use an Asaas API Key") são vagas demais
+ * para checar sem inventar — ficam de fora de propósito.
+ *
+ * Devolve null quando o campo veio ausente/vazio — aí a criação gera um token.
+ */
 function assertAuthToken(token: unknown): string | null {
   if (token === undefined || token === null || token === '') return null
   if (typeof token !== 'string') {
@@ -64,7 +82,15 @@ function assertAuthToken(token: unknown): string | null {
       `O token de autenticação deve ter entre ${AUTH_TOKEN_MIN} e ${AUTH_TOKEN_MAX} caracteres.`,
     )
   }
+  if (/\s/.test(token)) {
+    throw invalid('authToken', 'O token de autenticação não deve conter espaços em branco.')
+  }
   return token
+}
+
+/** Token seguro gerado quando o POST não traz `authToken`. */
+function generateAuthToken(ctx: AppContext): string {
+  return ctx.rng.alphanumeric(48)
 }
 
 function assertUrl(url: unknown): string {
@@ -148,6 +174,15 @@ export const webhookHandlers: HandlerMap = {
       )
     }
 
+    const providedToken = assertAuthToken(b.authToken)
+    /**
+     * "If the field is not provided, Asaas will automatically generate a secure
+     * value." (docs.asaas.com → Create a new Webhook). O valor gerado volta NESTA
+     * resposta — é a única chance de o integrador conhecê-lo sem consultar o
+     * painel.
+     */
+    const authToken = providedToken ?? generateAuthToken(ctx)
+
     const row: WebhookRow = {
       id: webhookConfigId(ctx.rng),
       accountId: auth.accountId,
@@ -156,7 +191,7 @@ export const webhookHandlers: HandlerMap = {
       email: String(b.email),
       enabled: b.enabled === undefined || b.enabled === null ? true : Boolean(b.enabled),
       interrupted: b.interrupted === true,
-      authToken: assertAuthToken(b.authToken),
+      authToken,
       apiVersion: b.apiVersion == null ? 3 : Number(b.apiVersion),
       sendType: (b.sendType as SendType) ?? 'SEQUENTIALLY',
       events: assertEvents(b.events),
@@ -164,7 +199,7 @@ export const webhookHandlers: HandlerMap = {
     }
 
     await ctx.db.insert(webhooks).values(row)
-    return serialize(row)
+    return serialize(row, true)
   },
 
   /** GET /v3/webhooks */
@@ -184,7 +219,7 @@ export const webhookHandlers: HandlerMap = {
       .limit(limit)
       .offset(offset)
 
-    return listEnvelope(rows.map(serialize), total, limit, offset)
+    return listEnvelope(rows.map((row) => serialize(row)), total, limit, offset)
   },
 
   /** GET /v3/webhooks/{id} */
