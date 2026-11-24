@@ -239,10 +239,10 @@ export async function createPayment(
     pixQrCodeId: null,
     pixTransactionId: null,
 
-    invoiceUrl: `https://localhost/i/${id.replace('pay_', '')}`,
+    invoiceUrl: `${ctx.config.publicBaseUrl}/i/${id.replace('pay_', '')}`,
     bankSlipUrl:
       input.billingType === 'BOLETO' || input.billingType === 'UNDEFINED'
-        ? `https://localhost/b/pdf/${id.replace('pay_', '')}`
+        ? `${ctx.config.publicBaseUrl}/b/pdf/${id.replace('pay_', '')}`
         : null,
     transactionReceiptUrl: null,
     invoiceNumber: ids.invoiceNumber(ctx.rng),

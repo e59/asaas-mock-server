@@ -16,6 +16,15 @@ afterEach(() => h?.close())
 const get = (app: Harness['app'], path: string) =>
   app.app.handle(new Request(`http://localhost${path}`))
 
+const post = (app: Harness['app'], path: string, body: unknown) =>
+  app.app.handle(
+    new Request(`http://localhost${path}`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(body),
+    }),
+  )
+
 describe('painel', () => {
   it('é servido na raiz, como HTML', async () => {
     h = await createHarness()
@@ -106,6 +115,45 @@ describe('painel', () => {
 
     // Carteiras distintas — é o que faz o split ter para onde ir.
     expect(sub.walletId).not.toBe(principal.walletId)
+  })
+
+  /**
+   * Criação de conta RAIZ independente — o que o CDA usa para dar a cada
+   * organização a sua própria conta (sem subcontas). A API real não tem isso;
+   * aqui é a peça que torna o webhook por conta fiel ao Asaas no ambiente local.
+   */
+  it('cria uma conta raiz independente com chave própria, idempotente por documento', async () => {
+    h = await createHarness()
+
+    const first = (await (
+      await post(h.app, '/_admin/accounts', {
+        name: 'Confederação X',
+        email: 'x@localhost',
+        cpfCnpj: '11.222.333/0001-81',
+      })
+    ).json()) as any
+
+    expect(first.created).toBe(true)
+    expect(first.id).not.toBe(h.accountId)
+    expect(first.apiKey).toStartWith('$aact_hmlg_')
+
+    const list = (await (await get(h.app, '/_admin/accounts')).json()) as any
+    const created = list.accounts.find((a: any) => a.id === first.id)
+    expect(created.parentAccountId).toBe(null) // conta RAIZ, nunca subconta
+    expect(created.walletId).toBe(first.walletId) // carteira própria
+    expect(created.walletId).not.toBe(h.app.seed.walletId)
+
+    // Mesmo documento → mesma conta e MESMA chave (re-seed não duplica).
+    const again = (await (
+      await post(h.app, '/_admin/accounts', {
+        name: 'outro nome',
+        email: 'y@localhost',
+        cpfCnpj: '11222333000181',
+      })
+    ).json()) as any
+    expect(again.id).toBe(first.id)
+    expect(again.apiKey).toBe(first.apiKey)
+    expect(again.created).toBe(false)
   })
 
   it('o saldo vem em REAIS, e acompanha o ledger', async () => {

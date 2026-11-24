@@ -14,7 +14,11 @@ import type { AppContext } from '../core/context.ts'
 import { badRequest } from '../core/errors.ts'
 import { accounts, apiKeys, webhookDeliveries, webhookEvents } from '../db/schema/index.ts'
 import { CARD_ERRORS, detectBrand, TEST_CARDS, TRIGGERS } from '../domain/credit-card.ts'
+import { personTypeOf } from '../domain/cpf-cnpj.ts'
+import * as ids from '../domain/ids.ts'
+import type { DB } from '../db/client.ts'
 import { OPERATION_COUNT, OPERATION_IDS } from '../generated/operations.ts'
+import { createAccountDocuments } from '../modules/account-documents/service.ts'
 import type { Scheduler } from '../scheduler/scheduler.ts'
 
 export function adminRoutes(ctx: AppContext, scheduler: Scheduler) {
@@ -58,6 +62,43 @@ export function adminRoutes(ctx: AppContext, scheduler: Scheduler) {
         /** Dias à frente do tempo REAL. 0 = o simulador está no presente. */
         driftDays: driftDays(ctx.clock),
       }))
+
+      /**
+       * Troca o `publicBaseUrl` em TEMPO DE EXECUÇÃO — o que o `PUBLIC_BASE_URL`
+       * do env não consegue fazer sem recriar o container.
+       *
+       * O caso de uso é o túnel: quando o dev expõe este simulador num
+       * `*.trycloudflare.com` (script de share do central-do-associado), as URLs
+       * que a API DEVOLVE (`invoiceUrl`, `bankSlipUrl`…) continuariam apontando
+       * para `central-do-associado.ddev.site:45445` — inalcançável de fora da
+       * máquina. O túnel chama este endpoint com a URL pública dele, e as
+       * cobranças criadas a partir daí carregam links clicáveis. Ao encerrar, o
+       * próprio script devolve o valor local.
+       *
+       * Volta ao valor do env no próximo restart do container, de propósito:
+       * túnel é estado de sessão, não configuração persistida.
+       */
+      .get('/config/public-base-url', () => ({ publicBaseUrl: ctx.config.publicBaseUrl }))
+      .post(
+        '/config/public-base-url',
+        ({ body }) => {
+          let parsed: URL
+          try {
+            parsed = new URL(body.url)
+          } catch {
+            throw badRequest('invalid_url', `"${body.url}" não é uma URL absoluta.`)
+          }
+          if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+            throw badRequest('invalid_url', 'publicBaseUrl precisa começar com http:// ou https://')
+          }
+          parsed.search = ''
+          parsed.hash = ''
+          // Sem barra final: `${base}/i/${id}` montaria `...//i/`.
+          ctx.config.publicBaseUrl = parsed.toString().replace(/\/+$/, '')
+          return { publicBaseUrl: ctx.config.publicBaseUrl }
+        },
+        { body: t.Object({ url: t.String({ minLength: 1 }) }) },
+      )
 
       /**
        * Volta o relógio para o tempo real. A saída da viagem no tempo.
@@ -318,5 +359,114 @@ export function adminRoutes(ctx: AppContext, scheduler: Scheduler) {
           })),
         }
       })
+
+      /**
+       * Cria uma conta RAIZ independente (parentAccountId = null) com chave
+       * própria — o análogo local de "cada organização tem sua própria conta
+       * Asaas", que é como o CDA opera: sem subcontas.
+       *
+       * A API real NÃO tem isso: contas raiz nascem do cadastro no site, e
+       * `POST /v3/accounts` só cria subcontas. Por isso mora atrás do
+       * `_admin`, como a viagem no tempo. Idempotente por `cpfCnpj`: chamar de
+       * novo para o mesmo documento devolve a conta e a chave existentes, que é
+       * o que permite re-seedar sem duplicar contas.
+       */
+      .post(
+        '/accounts',
+        async ({ body }) => {
+          const b = body as { name: string; email?: string; cpfCnpj: string }
+          const cpfCnpj = String(b.cpfCnpj).replace(/\D/g, '') || String(b.cpfCnpj)
+
+          const [existing] = await ctx.db
+            .select()
+            .from(accounts)
+            .where(eq(accounts.cpfCnpj, cpfCnpj))
+            .limit(1)
+
+          if (existing) {
+            const [key] = await ctx.db
+              .select()
+              .from(apiKeys)
+              .where(eq(apiKeys.accountId, existing.id))
+              .limit(1)
+
+            return {
+              id: existing.id,
+              walletId: existing.walletId,
+              cpfCnpj: existing.cpfCnpj,
+              name: existing.name,
+              apiKey: key?.key ?? null,
+              created: false,
+            }
+          }
+
+          const now = ctx.clock.timestamp()
+          const accountId = ids.accountId(ctx.rng)
+          const walletId = ids.walletId(ctx.rng)
+          const key = ids.apiKey(ctx.rng)
+          const personType = personTypeOf(cpfCnpj)
+          const name = String(b.name)
+
+          await ctx.db.transaction(async (tx) => {
+            await tx.insert(accounts).values({
+              id: accountId,
+              walletId,
+              parentAccountId: null,
+              name,
+              companyName: null,
+              tradingName: name,
+              email: String(b.email ?? `${accountId}@mock.local`),
+              loginEmail: null,
+              cpfCnpj,
+              personType,
+              companyType: null,
+              birthDate: null,
+              mobilePhone: null,
+              phone: null,
+              site: null,
+              address: null,
+              addressNumber: null,
+              complement: null,
+              province: null,
+              postalCode: null,
+              city: null,
+              state: null,
+              country: 'Brasil',
+              incomeCents: null,
+              status: 'APPROVED',
+              balanceCents: 0,
+              accountNumber: `${ctx.rng.digits(6)}-${ctx.rng.digits(1)}`,
+              dateCreated: now,
+            })
+
+            await tx.insert(apiKeys).values({
+              id: ids.genericId(ctx.rng),
+              accountId,
+              key,
+              name: 'Chave principal',
+              active: true,
+              dateCreated: now,
+              expirationDate: null,
+            })
+
+            // Conta em uso no sandbox já vem com KYC aprovado; é o que a
+            // mantém transacionando desde o primeiro request.
+            await createAccountDocuments(
+              tx as unknown as DB,
+              { clock: ctx.clock, rng: ctx.rng, config: ctx.config },
+              { accountId, name, personType, companyType: null, approved: true },
+            )
+          })
+
+          return { id: accountId, walletId, cpfCnpj, name, apiKey: key, created: true }
+        },
+        {
+          body: t.Object({
+            name: t.String(),
+            email: t.Optional(t.String()),
+            cpfCnpj: t.String(),
+          }),
+        },
+      )
   )
 }

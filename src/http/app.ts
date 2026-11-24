@@ -3,6 +3,7 @@ import { panelRoutes } from '../admin/panel.ts'
 import { adminRoutes } from '../admin/routes.ts'
 import type { AppContext } from '../core/context.ts'
 import { AsaasError, unauthorized } from '../core/errors.ts'
+import { invoicePage } from '../modules/payments/invoice-page.ts'
 import type { Scheduler } from '../scheduler/scheduler.ts'
 import { authenticate } from './auth.ts'
 import { registerOperations, type HandlerMap, type RegisterResult } from './register.ts'
@@ -83,6 +84,7 @@ export function createApp(deps: AppDeps): { app: Elysia; coverage: RegisterResul
       clockMode: ctx.clock.mode,
     }))
     .use(panelRoutes(ctx))
+    .use(invoicePage(ctx))
     .use(adminRoutes(ctx, deps.scheduler))
     .use(api)
 
